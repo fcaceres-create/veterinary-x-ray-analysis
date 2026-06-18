@@ -240,6 +240,11 @@ export function LiveDemoSlide() {
   const [diagError, setDiagError]     = useState<string | null>(null)
   const [portalMounted, setPortalMounted] = useState(false)
 
+  // Lightbox (zoom de imagen)
+  const [zoomSrc, setZoomSrc]   = useState<string | null>(null)
+  const [zoomBig, setZoomBig]   = useState(false)
+  function openZoom(src: string | null) { if (src) { setZoomSrc(src); setZoomBig(false) } }
+
   const esRef     = useRef<EventSource | null>(null)
   const logEndRef = useRef<HTMLDivElement>(null)
   const fileRef   = useRef<HTMLInputElement>(null)
@@ -247,6 +252,12 @@ export function LiveDemoSlide() {
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: "smooth" }) }, [pipeLog])
   useEffect(() => () => { esRef.current?.close() }, [])
   useEffect(() => { setPortalMounted(true) }, [])
+  useEffect(() => {
+    if (!zoomSrc) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setZoomSrc(null) }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [zoomSrc])
 
   // Derived
   const predicted = prob !== null ? (prob >= THRESHOLD ? "Patológica" : "Normal") : null
@@ -435,7 +446,11 @@ export function LiveDemoSlide() {
 
             {/* Left: X-ray viewer */}
             <Panel className="flex min-h-0 flex-col gap-3">
-              <div className="relative overflow-hidden rounded-lg bg-black" style={{ height: 210 }}>
+              <div
+                className={["relative overflow-hidden rounded-lg bg-black", imageSrc ? "cursor-zoom-in" : ""].join(" ")}
+                style={{ height: 210 }}
+                onClick={() => imageSrc && openZoom(showGradcam && overlayUrl ? overlayUrl : imageSrc)}
+              >
                 {imageSrc ? (
                   <>
                     {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -532,7 +547,8 @@ export function LiveDemoSlide() {
                     </div>
                   ) : overlayUrl && done ? (
                     // eslint-disable-next-line @next/next/no-img-element
-                    <img src={overlayUrl} alt="Grad-CAM" className="absolute inset-0 h-full w-full object-contain" />
+                    <img src={overlayUrl} alt="Grad-CAM" onClick={() => openZoom(overlayUrl)}
+                      className="absolute inset-0 h-full w-full cursor-zoom-in object-contain transition-transform hover:scale-[1.03]" />
                   ) : (
                     <div className="flex h-full items-center justify-center">
                       <p className="whitespace-pre text-center text-[10px] leading-relaxed text-muted-foreground">
@@ -626,7 +642,7 @@ export function LiveDemoSlide() {
                 {pipeRun === "error" && <span className="ml-auto text-[10px] font-bold text-hud-red">✗ Error</span>}
               </div>
               <div className="overflow-y-auto rounded-lg bg-black p-3 font-mono text-[10px] leading-relaxed" style={{ maxHeight: 230 }}>
-                {pipeLog.length === 0 && <span className="animate-pulse text-hud-amber">Iniciando Python…</span>}
+                {pipeLog.length === 0 && <span className="animate-pulse text-hud-amber">Iniciando pipeline…</span>}
                 {pipeLog.map((line, i) => (
                   <div key={i} className={
                     line.startsWith("✓") || line.startsWith("✅") ? "text-green-400" :
@@ -774,6 +790,38 @@ export function LiveDemoSlide() {
               </button>
             </div>
           )}
+        </div>
+      </div>,
+      document.body,
+    )}
+
+    {/* ── Lightbox / zoom de imagen (portal) ── */}
+    {portalMounted && zoomSrc && createPortal(
+      <div
+        className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/90 p-4 backdrop-blur-sm"
+        onClick={() => setZoomSrc(null)}
+      >
+        <button
+          onClick={() => setZoomSrc(null)}
+          className="absolute right-4 top-4 z-10 rounded-lg border border-border/60 bg-black/40 p-2 text-muted-foreground transition-colors hover:border-hud-red/50 hover:text-hud-red"
+        >
+          <X className="size-5" />
+        </button>
+        <span className="pointer-events-none absolute bottom-4 left-1/2 -translate-x-1/2 rounded-md bg-black/50 px-3 py-1 text-[11px] text-muted-foreground">
+          Click en la imagen para {zoomBig ? "alejar" : "acercar"} · Esc o fondo para cerrar
+        </span>
+        <div className="max-h-[92vh] max-w-[94vw] overflow-auto" onClick={(e) => e.stopPropagation()}>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={zoomSrc}
+            alt="Zoom"
+            onClick={() => setZoomBig((v) => !v)}
+            style={zoomBig ? { width: "160vw", maxWidth: "none" } : undefined}
+            className={[
+              "select-none rounded-lg object-contain transition-all duration-200",
+              zoomBig ? "cursor-zoom-out" : "max-h-[92vh] max-w-[94vw] cursor-zoom-in",
+            ].join(" ")}
+          />
         </div>
       </div>,
       document.body,
