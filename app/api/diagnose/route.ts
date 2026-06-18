@@ -52,7 +52,7 @@ Próximos pasos clínicos sugeridos.
     },
     body: JSON.stringify({
       model,
-      max_tokens: 1024,
+      max_tokens: 3000,
       messages: [
         {
           role: "user",

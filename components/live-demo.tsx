@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState, type ReactNode } from "react"
 import { createPortal } from "react-dom"
 import {
   Activity, CheckCircle2, AlertTriangle, ScanLine, Eye,
@@ -204,6 +204,83 @@ function fmtDate(d: Date) {
   return d.toLocaleDateString("es-AR", { day: "2-digit", month: "2-digit" })
 }
 
+// ── Mini-renderer de Markdown (negritas, itálicas, títulos, listas, hr) ──────
+function renderInline(text: string, keyBase: string): ReactNode[] {
+  const nodes: ReactNode[] = []
+  const re = /(\*\*[^*]+\*\*|\*[^*\n]+\*|`[^`]+`)/g
+  let last = 0, m: RegExpExecArray | null, i = 0
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) nodes.push(text.slice(last, m.index))
+    const tok = m[0]
+    if (tok.startsWith("**")) {
+      nodes.push(<strong key={`${keyBase}-s${i}`} className="font-semibold text-foreground">{tok.slice(2, -2)}</strong>)
+    } else if (tok.startsWith("`")) {
+      nodes.push(<code key={`${keyBase}-c${i}`} className="rounded bg-secondary px-1 py-0.5 font-mono text-[0.85em] text-hud-cyan">{tok.slice(1, -1)}</code>)
+    } else {
+      nodes.push(<em key={`${keyBase}-i${i}`} className="italic text-foreground/75">{tok.slice(1, -1)}</em>)
+    }
+    last = m.index + tok.length
+    i++
+  }
+  if (last < text.length) nodes.push(text.slice(last))
+  return nodes
+}
+
+function Markdown({ text }: { text: string }) {
+  const lines = text.replace(/\r/g, "").split("\n")
+  const blocks: ReactNode[] = []
+  let list: string[] = []
+  let listType: "ul" | "ol" | null = null
+
+  const flushList = (key: string) => {
+    if (!list.length) { listType = null; return }
+    const items = list
+    blocks.push(
+      listType === "ol" ? (
+        <ol key={key} className="my-2 ml-5 list-decimal space-y-1.5">
+          {items.map((it, i) => <li key={i} className="pl-1 leading-relaxed text-foreground/90">{renderInline(it, `${key}-${i}`)}</li>)}
+        </ol>
+      ) : (
+        <ul key={key} className="my-2 ml-5 list-disc space-y-1.5 marker:text-hud-cyan">
+          {items.map((it, i) => <li key={i} className="pl-1 leading-relaxed text-foreground/90">{renderInline(it, `${key}-${i}`)}</li>)}
+        </ul>
+      ),
+    )
+    list = []; listType = null
+  }
+
+  lines.forEach((raw, idx) => {
+    const line = raw.trim()
+    const key  = `b-${idx}`
+
+    if (/^---+$/.test(line))      { flushList(key); blocks.push(<hr key={key} className="my-3 border-border/70" />); return }
+    if (!line)                    { flushList(key); return }
+
+    const h = line.match(/^(#{1,4})\s+(.*)$/)
+    if (h) {
+      flushList(key)
+      const lvl = h[1].length
+      const cls = lvl === 1 ? "mb-2 mt-1 text-base font-bold text-hud-cyan"
+                : lvl === 2 ? "mb-1.5 mt-3 text-sm font-bold text-foreground"
+                :             "mb-1 mt-2 text-sm font-semibold text-foreground/90"
+      blocks.push(<p key={key} className={cls}>{renderInline(h[2], key)}</p>)
+      return
+    }
+
+    const ol = line.match(/^\d+\.\s+(.*)$/)
+    if (ol) { if (listType === "ul") flushList(key); listType = "ol"; list.push(ol[1]); return }
+
+    const ul = line.match(/^[-*]\s+(.*)$/)
+    if (ul) { if (listType === "ol") flushList(key); listType = "ul"; list.push(ul[1]); return }
+
+    flushList(key)
+    blocks.push(<p key={key} className="my-1.5 leading-relaxed text-foreground/90">{renderInline(line, key)}</p>)
+  })
+  flushList("b-end")
+
+  return <div className="text-sm">{blocks}</div>
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 export function LiveDemoSlide() {
   // View
@@ -248,6 +325,7 @@ export function LiveDemoSlide() {
   const esRef     = useRef<EventSource | null>(null)
   const logEndRef = useRef<HTMLDivElement>(null)
   const fileRef   = useRef<HTMLInputElement>(null)
+  const diagCache = useRef<Map<string, string>>(new Map())  // diagnóstico cacheado por imagen
 
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: "smooth" }) }, [pipeLog])
   useEffect(() => () => { esRef.current?.close() }, [])
@@ -375,7 +453,13 @@ export function LiveDemoSlide() {
 
   async function openDiagnosis() {
     if (!imageSrc || prob === null) return
-    setDiagOpen(true); setDiagLoading(true); setDiagText(""); setDiagError(null)
+    setDiagOpen(true); setDiagError(null)
+
+    // Si ya consultamos esta imagen, mostramos el resultado cacheado al instante.
+    const cached = diagCache.current.get(imageSrc)
+    if (cached) { setDiagText(cached); setDiagLoading(false); return }
+
+    setDiagLoading(true); setDiagText("")
     try {
       const { data, mediaType } = await toBase64(imageSrc)
       const res  = await fetch("/api/diagnose", {
@@ -386,6 +470,7 @@ export function LiveDemoSlide() {
       const json = await res.json()
       if (!res.ok) throw new Error(json.error || "Error del servidor")
       setDiagText(json.diagnosis)
+      diagCache.current.set(imageSrc, json.diagnosis)  // cachear para próximas consultas
     } catch (err: any) {
       setDiagError(err.message)
     } finally {
@@ -770,9 +855,7 @@ export function LiveDemoSlide() {
                 <p className="text-sm text-hud-red">{diagError}</p>
               </div>
             ) : (
-              <pre className="whitespace-pre-wrap font-sans text-sm leading-relaxed text-foreground/90">
-                {diagText}
-              </pre>
+              <Markdown text={diagText} />
             )}
           </div>
 
