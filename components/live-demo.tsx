@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react"
 import { createPortal } from "react-dom"
 import {
   Activity, CheckCircle2, AlertTriangle, ScanLine, Eye,
-  Upload, Play, Loader2, Terminal, Clock, Stethoscope, X,
+  Upload, Play, Loader2, Terminal, Clock, Stethoscope, X, Download,
 } from "lucide-react"
 import { SlideShell, Panel } from "@/components/hud"
 
@@ -204,6 +204,102 @@ function fmtDate(d: Date) {
   return d.toLocaleDateString("es-AR", { day: "2-digit", month: "2-digit" })
 }
 
+// Colores rotativos para los títulos de sección (pantalla y PDF).
+const SECTION_COLORS = ["var(--hud-cyan)", "var(--hud-amber)", "var(--hud-green)", "#c084fc", "var(--hud-red)"]
+const PRINT_SECTION_COLORS = ["#0e7c8c", "#b3781a", "#138a5e", "#7c3aed", "#c0392b"]
+
+// ── Conversión de Markdown → HTML (para el PDF imprimible) ───────────────────
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string
+  ))
+}
+function inlineToHtml(text: string): string {
+  let t = escapeHtml(text)
+  t = t.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+  t = t.replace(/\*([^*]+)\*/g, "<em>$1</em>")
+  t = t.replace(/`([^`]+)`/g, "<code>$1</code>")
+  return t
+}
+function mdToHtml(md: string): string {
+  const lines = md.replace(/\r/g, "").split("\n")
+  let html = "", listType: "ul" | "ol" | null = null, sec = 0
+  let list: string[] = []
+  const flush = () => {
+    if (!list.length) { listType = null; return }
+    const tag = listType === "ol" ? "ol" : "ul"
+    html += `<${tag}>` + list.map((it) => `<li>${inlineToHtml(it)}</li>`).join("") + `</${tag}>`
+    list = []; listType = null
+  }
+  for (const raw of lines) {
+    const line = raw.trim()
+    if (/^---+$/.test(line)) { flush(); html += "<hr/>"; continue }
+    if (!line) { flush(); continue }
+    const h1 = line.match(/^#\s+(.*)$/)
+    if (h1) { flush(); html += `<h1>${inlineToHtml(h1[1])}</h1>`; continue }
+    const hN = line.match(/^#{2,4}\s+(.*)$/)
+    const bold = line.match(/^\*\*(.+?)\*\*:?\s*$/)
+    if (hN || bold) {
+      flush()
+      const color = PRINT_SECTION_COLORS[sec % PRINT_SECTION_COLORS.length]; sec++
+      const title = inlineToHtml((hN ? hN[1] : bold![1]).replace(/:$/, ""))
+      html += `<h2 style="color:${color};border-left:4px solid ${color}">${title}</h2>`
+      continue
+    }
+    const ol = line.match(/^\d+\.\s+(.*)$/)
+    if (ol) { if (listType === "ul") flush(); listType = "ol"; list.push(ol[1]); continue }
+    const ul = line.match(/^[-*]\s+(.*)$/)
+    if (ul) { if (listType === "ol") flush(); listType = "ul"; list.push(ul[1]); continue }
+    flush(); html += `<p>${inlineToHtml(line)}</p>`
+  }
+  flush()
+  return html
+}
+function buildReportHtml(
+  md: string,
+  meta: { title: string; predicted: string | null; prob: number | null; actual?: string | null; label?: string; date: string },
+): string {
+  const pct = meta.prob !== null ? `${Math.round(meta.prob * 100)}%` : "—"
+  const predColor = meta.predicted === "Patológica" ? "#c0392b" : "#0e7c8c"
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"/>
+<title>${escapeHtml(meta.title)}</title>
+<style>
+  @page { margin: 18mm 16mm; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; color: #1a1f29; line-height: 1.55; font-size: 12.5px; margin: 0; }
+  .hdr { border-bottom: 2px solid #0e7c8c; padding-bottom: 10px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: flex-end; }
+  .hdr .kicker { color: #0e7c8c; font-size: 10px; letter-spacing: .18em; text-transform: uppercase; font-weight: 700; }
+  .hdr h0 { display:block; font-size: 18px; font-weight: 800; margin: 2px 0 0; }
+  .badge { text-align: right; font-size: 11px; color: #5b6675; }
+  .badge b { color: ${predColor}; font-size: 13px; }
+  h1 { font-size: 16px; color: #0e7c8c; margin: 4px 0 12px; }
+  h2 { font-size: 13px; margin: 18px 0 6px; padding-left: 9px; letter-spacing: .02em; }
+  p { margin: 6px 0; }
+  ul, ol { margin: 6px 0 6px 4px; padding-left: 20px; }
+  li { margin: 3px 0; }
+  code { background: #eef1f4; border-radius: 3px; padding: 1px 4px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .9em; }
+  hr { border: none; border-top: 1px solid #dde2e8; margin: 14px 0; }
+  strong { color: #0b0f16; }
+  .ftr { margin-top: 22px; padding-top: 10px; border-top: 1px solid #dde2e8; font-size: 10px; color: #8a93a0; }
+</style></head><body>
+  <div class="hdr">
+    <div>
+      <div class="kicker">Detección de patologías · CNN · MobileNetV2</div>
+      <h0>Diagnóstico Radiológico Veterinario</h0>
+    </div>
+    <div class="badge">
+      <div>Predicción modelo: <b>${escapeHtml(meta.predicted ?? "—")} · ${pct}</b></div>
+      ${meta.actual ? `<div>Etiqueta real: ${escapeHtml(meta.actual)}</div>` : ""}
+      ${meta.label ? `<div>Imagen: ${escapeHtml(meta.label)}</div>` : ""}
+      <div>${escapeHtml(meta.date)}</div>
+    </div>
+  </div>
+  <main>${mdToHtml(md)}</main>
+  <div class="ftr">Generado por Claude (IA) · Análisis demostrativo — Trabajo Final, Maestría en Ciencia de Datos, CAECE 2026. No reemplaza el criterio de un profesional veterinario.</div>
+  <script>window.onload=function(){window.focus();window.print();};window.onafterprint=function(){window.close();};</script>
+</body></html>`
+}
+
 // ── Mini-renderer de Markdown (negritas, itálicas, títulos, listas, hr) ──────
 function renderInline(text: string, keyBase: string): ReactNode[] {
   const nodes: ReactNode[] = []
@@ -231,6 +327,7 @@ function Markdown({ text }: { text: string }) {
   const blocks: ReactNode[] = []
   let list: string[] = []
   let listType: "ul" | "ol" | null = null
+  let sectionIdx = 0
 
   const flushList = (key: string) => {
     if (!list.length) { listType = null; return }
@@ -256,14 +353,27 @@ function Markdown({ text }: { text: string }) {
     if (/^---+$/.test(line))      { flushList(key); blocks.push(<hr key={key} className="my-3 border-border/70" />); return }
     if (!line)                    { flushList(key); return }
 
-    const h = line.match(/^(#{1,4})\s+(.*)$/)
-    if (h) {
+    // Título principal (#)
+    const h1 = line.match(/^#\s+(.*)$/)
+    if (h1) {
       flushList(key)
-      const lvl = h[1].length
-      const cls = lvl === 1 ? "mb-2 mt-1 text-base font-bold text-hud-cyan"
-                : lvl === 2 ? "mb-1.5 mt-3 text-sm font-bold text-foreground"
-                :             "mb-1 mt-2 text-sm font-semibold text-foreground/90"
-      blocks.push(<p key={key} className={cls}>{renderInline(h[2], key)}</p>)
+      blocks.push(<p key={key} className="mb-3 mt-1 text-base font-bold" style={{ color: "var(--hud-cyan)" }}>{renderInline(h1[1], key)}</p>)
+      return
+    }
+    // Secciones: "## …", "### …" o una línea completa en negrita "**…**"
+    const hN       = line.match(/^#{2,4}\s+(.*)$/)
+    const boldLine = line.match(/^\*\*(.+?)\*\*:?\s*$/)
+    if (hN || boldLine) {
+      flushList(key)
+      const color = SECTION_COLORS[sectionIdx % SECTION_COLORS.length]
+      sectionIdx++
+      const title = (hN ? hN[1] : boldLine![1]).replace(/:$/, "")
+      blocks.push(
+        <p key={key} className="mb-1.5 mt-4 flex items-center gap-2 text-sm font-bold" style={{ color }}>
+          <span className="inline-block h-4 w-1 shrink-0 rounded-full" style={{ background: color }} />
+          {renderInline(title, key)}
+        </p>,
+      )
       return
     }
 
@@ -476,6 +586,22 @@ export function LiveDemoSlide() {
     } finally {
       setDiagLoading(false)
     }
+  }
+
+  function downloadPdf() {
+    if (!diagText) return
+    const safe  = (imageLabel || "radiografia").replace(/[^\w.-]+/g, "_").slice(0, 40)
+    const now   = new Date()
+    const html  = buildReportHtml(diagText, {
+      title:     `Diagnostico_${safe}`,
+      predicted, prob,
+      actual:    actualLabel,
+      label:     imageLabel || undefined,
+      date:      now.toLocaleString("es-AR", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }),
+    })
+    const w = window.open("", "_blank", "width=900,height=1000")
+    if (!w) { setDiagError("Permití las ventanas emergentes para descargar el PDF."); return }
+    w.document.open(); w.document.write(html); w.document.close()
   }
 
   // ════════════════════════════════════════════════════════════════════════
@@ -865,12 +991,21 @@ export function LiveDemoSlide() {
               <p className="text-[10px] text-muted-foreground">
                 Generado por Claude · uso académico exclusivo
               </p>
-              <button
-                onClick={() => navigator.clipboard.writeText(diagText)}
-                className="rounded-md border border-border px-3 py-1 text-[10px] text-muted-foreground transition-colors hover:border-hud-cyan/40 hover:text-hud-cyan"
-              >
-                Copiar texto
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => navigator.clipboard.writeText(diagText)}
+                  className="rounded-md border border-border px-3 py-1 text-[10px] text-muted-foreground transition-colors hover:border-hud-cyan/40 hover:text-hud-cyan"
+                >
+                  Copiar texto
+                </button>
+                <button
+                  onClick={downloadPdf}
+                  className="flex items-center gap-1.5 rounded-md border border-hud-cyan/40 bg-hud-cyan/10 px-3 py-1 text-[10px] font-semibold text-hud-cyan transition-colors hover:bg-hud-cyan/20"
+                >
+                  <Download className="size-3" />
+                  Descargar PDF
+                </button>
+              </div>
             </div>
           )}
         </div>
