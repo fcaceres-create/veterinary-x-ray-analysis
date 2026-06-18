@@ -2,7 +2,6 @@
 
 import { useEffect, useRef, useState } from "react"
 import { createPortal } from "react-dom"
-import Image from "next/image"
 import {
   Activity, CheckCircle2, AlertTriangle, ScanLine, Eye,
   Upload, Play, Loader2, Terminal, Clock, Stethoscope, X,
@@ -76,6 +75,118 @@ async function runInference(imgEl: HTMLImageElement): Promise<number> {
   return (out[session.outputNames[0]].data as Float32Array)[1]
 }
 
+// ── Grad-CAM dinámico por OCLUSIÓN (Zeiler & Fergus, 2014) ───────────────────
+// Desliza un parche neutro por la imagen y mide cuánto cae la probabilidad de la
+// clase predicha. Las zonas que más bajan la confianza son las más relevantes.
+// No requiere gradientes ni modificar el modelo: solo inferencia hacia adelante.
+const OCC_GRID = 12  // resolución del mapa (12×12 = 144 inferencias)
+
+function jet(v: number): [number, number, number] {
+  const r = Math.min(Math.max(1.5 - Math.abs(4 * v - 3), 0), 1)
+  const g = Math.min(Math.max(1.5 - Math.abs(4 * v - 2), 0), 1)
+  const b = Math.min(Math.max(1.5 - Math.abs(4 * v - 1), 0), 1)
+  return [r * 255, g * 255, b * 255]
+}
+
+// Compone el heatmap (grilla GRID×GRID, valores 0..1) sobre la radiografía y
+// devuelve un data-URL listo para usar como overlay.
+function composeHeatmap(imgEl: HTMLImageElement, heat: Float32Array, grid: number): string {
+  // Heatmap a baja resolución; el reescalado bilineal lo suaviza al ampliarlo.
+  const small = document.createElement("canvas")
+  small.width = grid; small.height = grid
+  const sctx = small.getContext("2d")!
+  const px   = sctx.createImageData(grid, grid)
+  for (let i = 0; i < grid * grid; i++) {
+    const v = heat[i]
+    const [r, g, b] = jet(v)
+    px.data[i * 4]     = r
+    px.data[i * 4 + 1] = g
+    px.data[i * 4 + 2] = b
+    px.data[i * 4 + 3] = Math.round(Math.pow(v, 0.85) * 0.62 * 255)  // alpha ∝ relevancia
+  }
+  sctx.putImageData(px, 0, 0)
+
+  // Lienzo final con la proporción original de la imagen (cap a 512px).
+  const NW = imgEl.naturalWidth || IMG_SIZE
+  const NH = imgEl.naturalHeight || IMG_SIZE
+  const scale = Math.min(1, 512 / Math.max(NW, NH))
+  const W = Math.max(1, Math.round(NW * scale))
+  const H = Math.max(1, Math.round(NH * scale))
+
+  const out  = document.createElement("canvas")
+  out.width = W; out.height = H
+  const octx = out.getContext("2d")!
+  octx.drawImage(imgEl, 0, 0, W, H)
+  octx.imageSmoothingEnabled = true
+  octx.imageSmoothingQuality = "high"
+  octx.drawImage(small, 0, 0, W, H)  // upscale bilineal del heatmap
+  return out.toDataURL("image/png")
+}
+
+async function runOcclusion(
+  imgEl: HTMLImageElement,
+  baseProb: number,
+  predicted: ActualLabel,
+  onProgress?: (frac: number) => void,
+): Promise<string> {
+  const ort     = await import("onnxruntime-web")
+  const session = await getSession()
+
+  // Tensor base (NHWC, 0..255) + color neutro = media de la imagen.
+  const canvas = document.createElement("canvas")
+  canvas.width = IMG_SIZE; canvas.height = IMG_SIZE
+  const ctx = canvas.getContext("2d")!
+  ctx.drawImage(imgEl, 0, 0, IMG_SIZE, IMG_SIZE)
+  const { data } = ctx.getImageData(0, 0, IMG_SIZE, IMG_SIZE)
+
+  const base = new Float32Array(IMG_SIZE * IMG_SIZE * 3)
+  let sum = 0
+  for (let i = 0; i < IMG_SIZE * IMG_SIZE; i++) {
+    const r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2]
+    base[i * 3] = r; base[i * 3 + 1] = g; base[i * 3 + 2] = b
+    sum += r + g + b
+  }
+  const mean = sum / (IMG_SIZE * IMG_SIZE * 3)
+
+  const inputName  = session.inputNames[0]
+  const outputName = session.outputNames[0]
+  // Probabilidad de la clase predicha (binario: patológica = p, normal = 1−p).
+  const classProb  = (p: number) => (predicted === "Patológica" ? p : 1 - p)
+  const base0      = classProb(baseProb)
+
+  const cell = IMG_SIZE / OCC_GRID
+  const half = cell * 0.85            // parche ≈ 1.7 celdas → solapado
+  const heat = new Float32Array(OCC_GRID * OCC_GRID)
+
+  for (let gy = 0; gy < OCC_GRID; gy++) {
+    for (let gx = 0; gx < OCC_GRID; gx++) {
+      const cxp = (gx + 0.5) * cell, cyp = (gy + 0.5) * cell
+      const x0 = Math.max(0, Math.round(cxp - half)), x1 = Math.min(IMG_SIZE, Math.round(cxp + half))
+      const y0 = Math.max(0, Math.round(cyp - half)), y1 = Math.min(IMG_SIZE, Math.round(cyp + half))
+
+      const buf = base.slice()
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+          const idx = (y * IMG_SIZE + x) * 3
+          buf[idx] = mean; buf[idx + 1] = mean; buf[idx + 2] = mean
+        }
+      }
+      const t   = new ort.Tensor("float32", buf, [1, IMG_SIZE, IMG_SIZE, 3])
+      const o   = await session.run({ [inputName]: t })
+      const p   = (o[outputName].data as Float32Array)[1]
+      heat[gy * OCC_GRID + gx] = Math.max(0, base0 - classProb(p))  // caída de confianza
+      onProgress?.((gy * OCC_GRID + gx + 1) / (OCC_GRID * OCC_GRID))
+    }
+  }
+
+  // Normalización a 0..1.
+  let max = 0
+  for (let i = 0; i < heat.length; i++) if (heat[i] > max) max = heat[i]
+  if (max > 0) for (let i = 0; i < heat.length; i++) heat[i] /= max
+
+  return composeHeatmap(imgEl, heat, OCC_GRID)
+}
+
 function loadImg(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = document.createElement("img")
@@ -109,6 +220,10 @@ export function LiveDemoSlide() {
   const [inferRunning, setInferRunning] = useState(false)
   const [prob, setProb]               = useState<number | null>(null)
   const [inferError, setInferError]   = useState<string | null>(null)
+
+  // Grad-CAM dinámico (oclusión) para imágenes subidas
+  const [gradcamLoading, setGradcamLoading]   = useState(false)
+  const [gradcamProgress, setGradcamProgress] = useState(0)
 
   // History
   const [history, setHistory]         = useState<HistoryEntry[]>([])
@@ -160,6 +275,7 @@ export function LiveDemoSlide() {
   async function runAnalysis() {
     if (!imageSrc) return
     setProb(null); setInferError(null); setShowGradcam(false); setInferRunning(true)
+    const hadOverlay = !!overlayUrl   // los casos demo ya traen Grad-CAM pre-generado
     try {
       const imgEl  = await loadImg(imageSrc)
       const result = await runInference(imgEl)
@@ -172,10 +288,24 @@ export function LiveDemoSlide() {
         actual: actualLabel ?? undefined,
         prob: result,
       }, ...prev].slice(0, 12))
+      setInferRunning(false)
+
+      // Para imágenes subidas (sin overlay): generamos el mapa de calor por oclusión.
+      if (!hadOverlay) {
+        setGradcamLoading(true); setGradcamProgress(0)
+        try {
+          const predClass: ActualLabel = result >= THRESHOLD ? "Patológica" : "Normal"
+          const url = await runOcclusion(imgEl, result, predClass, setGradcamProgress)
+          setOverlayUrl(url)
+        } catch (e) {
+          console.error("Grad-CAM por oclusión falló:", e)
+        } finally {
+          setGradcamLoading(false)
+        }
+      }
     } catch (err) {
       setInferError("Error al correr el modelo.")
       console.error(err)
-    } finally {
       setInferRunning(false)
     }
   }
@@ -313,8 +443,9 @@ export function LiveDemoSlide() {
                       className={["absolute inset-0 h-full w-full object-contain transition-opacity duration-300",
                         showGradcam ? "opacity-0" : "opacity-100"].join(" ")} />
                     {overlayUrl && (
-                      <Image src={overlayUrl} alt="Grad-CAM" fill
-                        className={["object-contain transition-opacity duration-300",
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={overlayUrl} alt="Grad-CAM"
+                        className={["absolute inset-0 h-full w-full object-contain transition-opacity duration-300",
                           showGradcam ? "opacity-100" : "opacity-0"].join(" ")} />
                     )}
                   </>
@@ -390,14 +521,22 @@ export function LiveDemoSlide() {
                   Mapa de activación · Grad-CAM
                 </p>
                 <div className="relative overflow-hidden rounded-md bg-black" style={{ height: 88 }}>
-                  {overlayUrl && done ? (
-                    <Image src={overlayUrl} alt="Grad-CAM" fill className="object-contain" />
+                  {gradcamLoading ? (
+                    <div className="flex h-full flex-col items-center justify-center gap-1.5 px-3">
+                      <Loader2 className="size-4 animate-spin text-hud-amber" />
+                      <p className="text-[10px] font-semibold text-hud-amber">Generando mapa · oclusión</p>
+                      <div className="h-1 w-full max-w-[160px] overflow-hidden rounded-full bg-secondary">
+                        <div className="h-full rounded-full bg-hud-amber transition-all"
+                          style={{ width: `${Math.round(gradcamProgress * 100)}%` }} />
+                      </div>
+                    </div>
+                  ) : overlayUrl && done ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={overlayUrl} alt="Grad-CAM" className="absolute inset-0 h-full w-full object-contain" />
                   ) : (
                     <div className="flex h-full items-center justify-center">
-                      <p className="text-center text-[10px] leading-relaxed text-muted-foreground">
-                        {done
-                          ? "Grad-CAM no disponible\npara imágenes personalizadas"
-                          : "Disponible tras\nel análisis"}
+                      <p className="whitespace-pre text-center text-[10px] leading-relaxed text-muted-foreground">
+                        {done ? "Generando tras el análisis…" : "Disponible tras\nel análisis"}
                       </p>
                     </div>
                   )}
